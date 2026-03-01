@@ -1,0 +1,603 @@
+{
+  "updatedAt": "2026-02-27T00:36:03.961Z",
+  "createdAt": "2026-02-26T23:12:14.643Z",
+  "id": "uc69w56GhU486GM9",
+  "name": "Agente AIOps",
+  "description": null,
+  "active": false,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        80,
+        -16
+      ],
+      "id": "556a400f-d1e0-4727-ad59-cf15545194f8",
+      "name": "When clicking ‘Execute workflow’"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://k8s-mcp:3001/mcp",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json, text/event-stream"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "kubectl_get", 
+    "arguments": {
+      "resourceType": "events",
+      "allNamespaces": true}
+  }
+}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        304,
+        -16
+      ],
+      "id": "bc1a5639-615c-43e8-aa9d-4c2bce329591",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extrai eventos da resposta do MCP (formato SSE)
+const response = $input.first().json;
+let eventList = [];
+
+try {
+  // A resposta vem no campo 'data' em formato SSE
+  let rawData = response.data || response;
+  
+  // Se for string, precisa parsear o SSE
+  if (typeof rawData === 'string') {
+    // Extrai o JSON do formato SSE (event: message
+data: {...})
+    const jsonMatch = rawData.match(/data:\s*(\{[\s\S]*\})\s*$/);
+    if (jsonMatch) {
+      rawData = JSON.parse(jsonMatch[1]);
+    }
+  }
+  
+  // Navega ate o conteudo dos eventos
+  const content = rawData.result && rawData.result.content && rawData.result.content[0] ? rawData.result.content[0].text : null;
+  if (content) {
+    const parsed = JSON.parse(content);
+    eventList = parsed.events || parsed.items || [];
+  }
+} catch (e) {
+  console.log('Erro ao parsear resposta MCP:', e.message);
+  return [{ json: { hasEvents: false, count: 0, error: e.message } }];
+}
+
+const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+
+// Filtra eventos Warning dos ultimos 5 minutos
+const filteredEvents = eventList.filter(event => {
+  const isWarning = event.type === 'Warning';
+  if (!isWarning) return false;
+
+  // Descarta eventos sem lastTimestamp valido
+  if (!event.lastTimestamp || event.lastTimestamp === '') return false;
+
+  const eventTime = new Date(event.lastTimestamp);
+  if (isNaN(eventTime.getTime())) return false;
+
+  return eventTime >= fiveMinutesAgo;
+});
+
+if (filteredEvents.length === 0) {
+  return [{ json: { hasEvents: false, count: 0 } }];
+}
+
+return filteredEvents.map((event, index) => ({ 
+  json: { 
+    ...event,
+    hasEvents: true,
+    eventIndex: index + 1,
+    totalEvents: filteredEvents.length
+  } 
+}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        528,
+        -16
+      ],
+      "id": "98461d5b-55dd-4f3b-93d1-44d6d3877714",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "aggregate": "aggregateAllItemData",
+        "destinationFieldName": "eventos",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [
+        752,
+        -16
+      ],
+      "id": "9ce0a5ab-6c22-4f73-b8be-29a44e5b2607",
+      "name": "Aggregate"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 3,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "e06405ae-6d0d-43b7-8cc7-9c1563d24561",
+              "leftValue": "={{ $json.eventos[0].hasEvents === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        976,
+        -16
+      ],
+      "id": "4d6bab05-dfb7-4a54-a4c1-74a105a0a4af",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Processa array de eventos agrupados, DEDUPLICA e cria prompt com eventos na integra
+const eventos = $json.eventos || [];
+
+if (eventos.length === 0) {
+  return [{ json: { hasEvents: false, count: 0, prompt: '' } }];
+}
+
+// Extrai dados de cada evento
+const eventosProcessados = eventos.map((event) => {
+  return {
+    eventType: event.type || event.eventType || 'Unknown',
+    reason: event.reason || '',
+    message: event.message || '',
+    resourceKind: event.involvedObject ? event.involvedObject.kind : (event.resourceKind || ''),
+    resourceName: event.involvedObject ? event.involvedObject.name : (event.resourceName || ''),
+    namespace: (event.metadata && event.metadata.namespace) ? event.metadata.namespace : ((event.involvedObject && event.involvedObject.namespace) ? event.involvedObject.namespace : (event.namespace || 'default')),
+    firstTimestamp: event.firstTimestamp || (event.metadata ? event.metadata.creationTimestamp : ''),
+    lastTimestamp: event.lastTimestamp || event.firstTimestamp || '',
+    count: event.count || 1,
+    sourceComponent: event.source ? (event.source.component || 'unknown') : 'unknown',
+    sourceHost: event.source ? (event.source.host || 'unknown') : 'unknown'
+  };
+});
+
+// DEDUPLICACAO melhorada - normaliza nomes de pods e UIDs
+const grupos = {};
+for (const evt of eventosProcessados) {
+  const msgNormalizada = evt.message
+    .replace(/[a-z0-9]+-[a-z0-9]+-[a-z0-9]+/g, '*')
+    .replace(/\b[a-f0-9]{8}-[a-f0-9-]{27,}\b/g, '*')
+    .replace(/in pod [^\s]+/g, 'in pod *')
+    .replace(/\([a-f0-9-]+\)/g, '(*)');
+  const chave = `${evt.reason}|${msgNormalizada}|${evt.namespace}|${evt.resourceKind}`;
+  
+  if (!grupos[chave]) {
+    grupos[chave] = {
+      reason: evt.reason,
+      message: evt.message,
+      namespace: evt.namespace,
+      resourceKind: evt.resourceKind,
+      eventType: evt.eventType,
+      podsAfetados: [],
+      totalOcorrencias: 0,
+      primeiroTimestamp: evt.firstTimestamp,
+      ultimoTimestamp: evt.lastTimestamp
+    };
+  }
+  
+  grupos[chave].totalOcorrencias++;
+  if (evt.resourceName && !grupos[chave].podsAfetados.includes(evt.resourceName)) {
+    grupos[chave].podsAfetados.push(evt.resourceName);
+  }
+  
+  if (evt.lastTimestamp && evt.lastTimestamp > grupos[chave].ultimoTimestamp) {
+    grupos[chave].ultimoTimestamp = evt.lastTimestamp;
+  }
+}
+
+const problemasUnicos = Object.values(grupos);
+
+// Prompt texto plano com problemas agrupados
+const problemasTexto = problemasUnicos.map((p, i) => 
+  `[Problema ${i + 1}] [${p.eventType}] ${p.reason}: ${p.message}
+Namespace: ${p.namespace} | Recurso: ${p.resourceKind} | Pods afetados: ${p.podsAfetados.length} (${p.podsAfetados.join(', ')}) | Ocorrencias: ${p.totalOcorrencias} | Primeiro: ${p.primeiroTimestamp || 'N/A'} | Ultimo: ${p.ultimoTimestamp || 'N/A'}`
+).join('
+
+');
+
+// Eventos individuais em texto plano
+const eventosTexto = eventosProcessados.map((e, i) =>
+  `Evento ${i + 1}: [${e.eventType}] ${e.reason} | ${e.message} | ${e.resourceKind}/${e.resourceName} | ns:${e.namespace} | count:${e.count} | source:${e.sourceComponent}/${e.sourceHost} | first:${e.firstTimestamp || 'N/A'} | last:${e.lastTimestamp || 'N/A'}`
+).join('
+');
+
+const prompt = `${problemasUnicos.length} problema(s) unico(s) de ${eventosProcessados.length} eventos totais
+
+--- PROBLEMAS AGRUPADOS ---
+${problemasTexto}
+
+--- EVENTOS COMPLETOS ---
+${eventosTexto}`;
+
+return [{
+  json: {
+    hasEvents: true,
+    count: eventosProcessados.length,
+    problemasUnicos: problemasUnicos.length,
+    eventos: eventosProcessados,
+    gruposDeProblemas: problemasUnicos,
+    prompt: prompt
+  }
+}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        -16
+      ],
+      "id": "74680db7-7334-46ce-9967-8fce0ac0b8f3",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.eventos }}",
+        "options": {
+          "systemMessage": "Voce e um analista especializado em diagnostico Kubernetes. Sua funcao e investigar e identificar problemas usando as ferramentas disponiveis.
+
+## REGRAS
+- Apenas diagnostica e sugere correcoes. NUNCA execute kubectl_patch, kubectl_apply ou kubectl_delete.
+- Use APENAS os parametros documentados das tools.
+- Investigue por PROBLEMA AGRUPADO, nao por evento individual.
+- Se ja tiver causa raiz + evidencias suficientes, passe ao proximo problema.
+- NUNCA chame a mesma ferramenta com os mesmos parametros duas vezes.
+
+## COMO INVESTIGAR
+Voce tem 3 ferramentas de leitura. Use-as IMEDIATAMENTE para coletar evidencias:
+- **kubectl_get**: visao geral dos recursos (status, restarts, idade). Use `name` OU `labelSelector`, NUNCA ambos juntos.
+- **kubectl_describe**: detalhes completos (eventos, conditions, configuracao).
+- **kubectl_logs**: logs do container. Use `previous: true` para logs de execucao anterior.
+
+Para cada problema recebido:
+1. Chame kubectl_describe no recurso afetado para obter detalhes
+2. Se necessario, chame kubectl_logs para ver erros da aplicacao
+3. Com as evidencias coletadas, escreva o relatorio
+
+## TRATAMENTO DE ERROS
+- "name cannot be provided when a selector is specified" -> Use APENAS name OU labelSelector
+- Se uma ferramenta falhar 2 vezes, registre o erro como evidencia e prossiga
+
+## SEVERIDADE
+- **CRITICO**: Pod/Deployment indisponivel, servico fora do ar
+- **ALTO**: Restarts frequentes, OOMKilled, recursos esgotados
+- **MEDIO**: Warnings recorrentes mas servico funcional
+- **BAIXO**: Eventos informativos, problemas cosmeticos
+
+## FORMATO DE RESPOSTA (Markdown)
+
+# Relatorio de Diagnostico Kubernetes
+
+## Resumo
+| Total | Criticos | Altos | Medios | Baixos |
+|-------|----------|-------|--------|--------|
+| X     | X        | X     | X      | X      |
+
+---
+
+## Problema 1: [causa raiz resumida]
+- **Severidade:** CRITICO | ALTO | MEDIO | BAIXO
+- **Namespace:** namespace-afetado
+- **Pods Afetados:** pod1, pod2
+
+### Causa Raiz
+Descricao clara do problema.
+
+### Evidencias
+- evidencia 1
+- evidencia 2
+
+### Solucao Recomendada
+Acao especifica para corrigir.
+
+### Comando Sugerido
+kubectl patch deployment nome -n namespace --type=merge -p '{"spec":...}'
+
+Repita a secao para cada problema. Responda APENAS com o relatorio markdown.",
+          "maxIterations": 60
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1424,
+        -16
+      ],
+      "id": "55af0aff-be95-48e1-b689-b43b9d39a6fe",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-pro-preview-customtools",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        208
+      ],
+      "id": "ff77203a-b4c9-40c2-bac0-4b497cf040dc",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "xfAiFSI2Y1RWe7Nz",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "endpointUrl": "http://k8s-mcp:3001/mcp",
+        "include": "selected",
+        "includeTools": [
+          "kubectl_get",
+          "kubectl_describe",
+          "kubectl_logs"
+        ],
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
+      "typeVersion": 1.2,
+      "position": [
+        1568,
+        208
+      ],
+      "id": "e81835e3-92dc-4856-a467-e73720ac3a0c",
+      "name": "MCP Client"
+    },
+    {
+      "parameters": {
+        "owner": {
+          "__rl": true,
+          "value": "fabricioveronez",
+          "mode": "list",
+          "cachedResultName": "fabricioveronez",
+          "cachedResultUrl": "https://github.com/fabricioveronez"
+        },
+        "repository": {
+          "__rl": true,
+          "value": "catalogo-docker-compose",
+          "mode": "list",
+          "cachedResultName": "catalogo-docker-compose",
+          "cachedResultUrl": "https://github.com/fabricioveronez/catalogo-docker-compose"
+        },
+        "title": "=Erro no Kubernetes {{ $now }}",
+        "body": "={{ $json.output }}",
+        "labels": [],
+        "assignees": []
+      },
+      "type": "n8n-nodes-base.github",
+      "typeVersion": 1.1,
+      "position": [
+        1776,
+        -16
+      ],
+      "id": "9d5dae6b-67ce-42a7-a0c5-00312c12bac2",
+      "name": "Create an issue",
+      "webhookId": "5d6bed90-fc54-4b88-a46a-9bfd3a59bc07",
+      "credentials": {
+        "githubApi": {
+          "id": "0uDNbxNV2uXQsIl5",
+          "name": "GitHub account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "guildId": {
+          "__rl": true,
+          "value": "1082635025100591166",
+          "mode": "list",
+          "cachedResultName": "Fabricio Veronez's Ambiente de Teste",
+          "cachedResultUrl": "https://discord.com/channels/1082635025100591166"
+        },
+        "channelId": {
+          "__rl": true,
+          "value": "1369368996012494859",
+          "mode": "list",
+          "cachedResultName": "erros",
+          "cachedResultUrl": "https://discord.com/channels/1082635025100591166/1369368996012494859"
+        },
+        "content": "=Erro no ambiente Kubernetes. 
+
+Mais informações acesse abaixo:
+
+ {{ $json.html_url }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.discord",
+      "typeVersion": 2,
+      "position": [
+        1984,
+        -16
+      ],
+      "id": "63988ec7-b5e7-468a-8fa6-d3cb9c687ece",
+      "name": "Send a message",
+      "webhookId": "c37d6365-9c6f-4a4a-9b11-447fca5ae002",
+      "credentials": {
+        "discordBotApi": {
+          "id": "qXU67Ccq3qh9KMBp",
+          "name": "Discord Bot account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Aggregate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MCP Client": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Create an issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create an issue": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "pinData": {},
+  "versionId": "4f6152ae-4ac4-4462-a151-8e126620cdfc",
+  "activeVersionId": null,
+  "versionCounter": 88,
+  "triggerCount": 0,
+  "tags": []
+}
